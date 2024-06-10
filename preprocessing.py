@@ -213,7 +213,8 @@ def type_fixer_upper(datadf, makestrcol, makedtcol, bigstats=False):
 
 # soon, add functionality for treating ordinally encoded variables as categorical (not imputed)
 def missing_outlier_machine(df, target, ordinal_cats=None, ordinal_cats_weights=None, z=3, trim=True):
-    cut_target = target.copy(deep=True)
+    # shallow referential copy, since we will not need the original target DF anymore
+    cut_target = target.copy(deep=False)
     # this machine needs to be able to handle NaNs
     df_num_only = df.copy(deep=True)
     n = len(df)
@@ -229,20 +230,28 @@ def missing_outlier_machine(df, target, ordinal_cats=None, ordinal_cats_weights=
         # BUT this relies on us inputting the respective category weights beforehand
         enc = OrdinalEncoder(categories=ordinal_cats_weights, handle_unknown='use_encoded_value', unknown_value=np.nan)
         ordinal_df = pd.DataFrame(enc.fit_transform(ordinal_df), index=ordinal_df.index, columns=ordinal_df.columns)
+    else:
+        ordinal_df = pd.DataFrame()
 
     # instantiate storage structure for high/low cardinality categorical features, numerical features,
     # and potential outliers
     hi_card_cat_cols = []
     lo_card_cat_cols = []
-    num_cols = []
     cut_cols = pd.DataFrame()
     potent_outlier_count = []
     for i in df.columns:
         # extract each feature as a pd series and infer its type with API function
         col_series = df[i]
         cur_type = pd.api.types.infer_dtype(col_series)
-        if cur_type == 'string' or cur_type == 'datetime64' or cur_type == 'mixed' or cur_type == 'categorical':
-            # treat types of string, datetime, mixed, or categorical as categorical variables
+        if (cur_type == 'string' or cur_type == 'datetime64' or cur_type == 'mixed' or cur_type == 'categorical'
+                or cur_type == 'boolean'):
+
+            # for the special case of boolean, where there are only categories, I am anticipating the potential
+            # for missing values by converting to string versions of "True" and "False."
+            if cur_type == 'boolean':
+                col_series = col_series.astype(str)
+
+            # treat types of string, datetime, mixed, categorical, or boolean as categorical variables
             if len(col_series.unique()) > 5:
                 # if they have more than 15 unique categories, an encoding strategy like target or catboost encoding
                 # will prove to be more useful, so extract column name to a high_cardinality storage array
@@ -261,7 +270,6 @@ def missing_outlier_machine(df, target, ordinal_cats=None, ordinal_cats_weights=
             # for categorical outliers, calculate the z score.
             # if observations have a value for this feature with a score greater than 3,
             # add them as a nparray to potential outlier storage array
-            num_cols.append(i)
             if trim:
                 col_z = (col_series - col_series.mean()) / (col_series.std(ddof=0))
                 potent_outlier_count.append(np.array(col_z[col_z > z].index))
@@ -275,16 +283,25 @@ def missing_outlier_machine(df, target, ordinal_cats=None, ordinal_cats_weights=
         # but more research needed.
         contam = len(out_count[out_count >= 2]) / n
         print('The proposed contamination value based on feature outlier count of 2 and z score of 3 is: %.3f' % contam)
+    else:
+        contam = 0
 
     # There will be no outliers in categorical columns, so while you're here replace NaN in them with a constant
     # string that will act as an additional category once encoded.
     # Additionally, since we do not want "missing" as a filled value for ordinal features, impute missing values with
     # the most frequent occurrence
 
-    filled_cut_cols = pd.DataFrame((SimpleImputer(strategy='constant', fill_value='missing', missing_values=np.nan).
-                                    fit_transform(cut_cols)), index=cut_cols.index, columns=cut_cols.columns)
+    if len(cut_cols) != 0:
+        filled_cut_cols = pd.DataFrame((SimpleImputer(strategy='constant', fill_value='missing', missing_values=np.nan).
+                                        fit_transform(cut_cols)), index=cut_cols.index, columns=cut_cols.columns)
+    else:
+        filled_cut_cols = cut_cols
 
-    cut_cut_cols = filled_cut_cols.copy(deep=True)
+    # this copy can be referential, we have no further use for the filled_cut_cols DF after copying.
+
+    cut_cut_cols = filled_cut_cols.copy(deep=False)
+
+    # this needs to be a deep copy, as we transform the num_only DF when using Isolation Forest
 
     cut_num_only = df_num_only.copy(deep=True)
 
@@ -487,7 +504,7 @@ def add_imputer(choice_string, df):
         # is required prior to use
 
         feat_norm = FeatureNormalizer()
-        temp_imputer = IterativeImputer(random_state=3)
+        temp_imputer = IterativeImputer(random_state=3, verbose=2)
         imputer = clone(temp_imputer)
         unfit_pipe = Pipeline([('norm', feat_norm), ('imp', imputer)])
         temp_pipe = Pipeline([('norm', feat_norm), ('quick_imp', temp_imputer)])
@@ -514,21 +531,14 @@ def add_imputer(choice_string, df):
 def add_selector(choice_string, test_df, cat_transformed_cols, unfit_pipe, discrete_indices, cat_target, impute_choice,
                  soft=False, norm=True):
     # add normalization if the feature selection method relies on Euclidean distance
-    # after encoding categorical variables and imputing missing values, add a normalization step for the case of
-    # Relief or Information gain based selection, which rely on nearest neighbor determination for feature
-    # selection. UNLESS, the imputing method is KNN, in which a normalization step has already been applied.
+    # after encoding categorical variables and imputing missing values, add a normalization step. UNLESS, the imputing
+    # method is KNN, in which a normalization step has already been applied. The normalization transformer can perform
+    # min-max, l1, l2, or absolute maximum scaling, the best result can be chosen by a parameter search. The default
+    # is l2.
 
-    if (choice_string == 'PCA' or choice_string == 'Recursive VIF' or choice_string == 'F Score') and norm:
-
-        unfit_pipe.steps.append(['min_max_scale', StandardScaler()])
-
-    elif (impute_choice != 'KNN' and impute_choice != 'MICE') and norm:
-
-        # this is insufficient, Normalizer() by default normalizes by observation rather than by feature
-        # to avoid information loss, create a custom transformer that uses preprocessing.normalize(axis=1)
-        # We want the FEATURE vector to have a unit length of 1
-
-        unfit_pipe.steps.append(['norm_by_feat', FeatureNormalizer()])
+    if ((choice_string != 'Forward' and choice_string != 'Backward' and choice_string == 'RFE') and
+            (impute_choice != 'KNN' and impute_choice != 'MICE') and norm):
+        unfit_pipe.steps.append(['norm', FeatureNormalizer()])
 
     if soft:
         sp_thresh = 40
@@ -574,7 +584,6 @@ def add_selector(choice_string, test_df, cat_transformed_cols, unfit_pipe, discr
 
         retain_names = SelectPDColumns(columns=cat_transformed_cols, want_columns=vif_select)
         unfit_pipe.steps.append(['vif_exclude', retain_names])
-
 
     elif choice_string == 'Information Gain':
 
@@ -742,7 +751,7 @@ def add_selector(choice_string, test_df, cat_transformed_cols, unfit_pipe, discr
 
 
 def setup_pipeline(df, target, imp_choice='MICE', ML=False, decision=None, hi_cat_cols=None, lo_cat_cols=None,
-                   cat_target=False, hybrid_plan=None):
+                   cat_target=False, hybrid_plan=None, ordinal_as_discrete=None):
     # this function initializes a sklearn pipeline for later machine learning analysis (RF, logit, LDA, etc.)
 
     # -----------------------------------------------------------------------------------------------------------------
@@ -820,6 +829,12 @@ def setup_pipeline(df, target, imp_choice='MICE', ML=False, decision=None, hi_ca
     else:
         cat_cols = []
 
+    # for the case where we want to count ordinally encoded variables as discrete while no other categorical features
+    # are present.
+
+    if ordinal_as_discrete:
+        cat_cols = cat_cols + ordinal_as_discrete
+
     # -----------------------------------------------------------------------------------------------------------------
 
     # reordering dataframe such that categorical columns appear first, convenient for error testing.
@@ -841,13 +856,25 @@ def setup_pipeline(df, target, imp_choice='MICE', ML=False, decision=None, hi_ca
         # feature names of the encoded variables, as the default output of sklearn transformers is an unlabeled nparray.
 
         shotgun = temp_pipe.fit(df, target)
-        new_names = shotgun['cat'].get_feature_names_out()
 
-        # Also, one hot encoded variables should be treated as discrete, not continuous like with catboost or ordinally
-        # encoded ones. Store these for later use in calculating information gain, as sklearn's MutualInfo functions
-        # perform poorly when they consider all features to be either discrete or continuous.
+        if cat_cols:
+            new_names = shotgun['cat'].get_feature_names_out()
 
-        discrete_indices = pd.Series(new_names)[pd.Series(new_names).str.startswith('0_low_card')].index.to_numpy()
+            # Also, one hot encoded variables should be treated as discrete, not continuous like with catboost or
+            # ordinally encoded ones. Store these for later use in calculating information gain, as sklearn's
+            # MutualInfo functions perform poorly when they consider all features to be either discrete or continuous.
+            if ordinal_as_discrete:
+                ordinals = tuple(ordinal_as_discrete)
+                hot_encoded = pd.Series(new_names)[pd.Series(new_names).str.startswith('0_low_card')].index.to_numpy()
+                ordinal_encoded = pd.Series(new_names)[pd.Series(new_names).str.endswith(ordinals)].index.to_numpy()
+                discrete_indices = np.concatenate([hot_encoded, ordinal_encoded])
+            else:
+                discrete_indices = pd.Series(new_names)[
+                    pd.Series(new_names).str.startswith('0_low_card')].index.to_numpy()
+        else:
+            new_names = df.columns
+            discrete_indices = []
+
         shotgunned = temp_pipe.transform(df)
         test_this = pd.DataFrame(shotgunned, columns=new_names, index=df.index)
 
@@ -891,11 +918,16 @@ class FeatureNormalizer(BaseEstimator, TransformerMixin):
         # Just a quick reminder!
 
         if self.norm == 'l2':
-            scale = np.sqrt(np.nansum(X**2, axis=0))
+            scale = np.sqrt(np.nansum(X ** 2, axis=0))
         elif self.norm == 'l1':
             scale = np.nansum(np.abs(X), axis=0)
-        else:
+        elif self.norm == 'max':
             scale = np.nanmax(np.abs(X), axis=0)
+        elif self.norm == 'min-max':
+            X = X - np.nanmax(np.abs(X), axis=0)
+            scale = np.nanmax(X, axis=0) - np.nanmin(X, axis=0)
+        else:
+            scale = 1
 
         # new axis here is used to increase the dimension of the scale nparray to 2D instead of 1D, such that X
         # can be divided by it.
@@ -968,7 +1000,10 @@ class SelectPDColumns(BaseEstimator, TransformerMixin):
         print(self.want_columns)
         return select_frame
 
+
 def selector_params_to_grid(choice_string, cat_target, grid, trim):
+    if choice_string != 'None':
+        grid['norm__norm'] = ['l1', 'l2', 'max', 'min-max']
     if choice_string == 'ReliefF':
         grid['relief_f__n_neighbors'] = [5, 10, 20, 40, 60, 80, 100, 500]
     elif choice_string == 'Forward' or choice_string == 'Backward' or choice_string == 'RFE':
@@ -986,9 +1021,10 @@ def selector_params_to_grid(choice_string, cat_target, grid, trim):
                 obj = 'reg:pseudohubererror'
             else:
                 obj = 'reg:squarederror'
-            grid['wrapper__estimator'] = [RandomForestRegressor(), ExtraTreesRegressor(), AdaBoostRegressor(),
-                                          xgb.XGBRegressor(objective=obj)]
+            grid['wrapper__estimator'] = [RandomForestRegressor(), ExtraTreesRegressor(),
+                                          AdaBoostRegressor(loss='exponential'), xgb.XGBRegressor(objective=obj)]
     return grid
+
 
 def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, ordinal_cats=None,
                     ordinal_cats_order=None):
@@ -1024,7 +1060,6 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
     option_outliers.grid(column=1, row=6)
     option_outliers.current(0)
 
-
     # fourth dropdown menu
     ttk.Label(base, text='Is the target categorical?', font=('Times New Roman', 10)).grid(column=0, row=7, padx=10,
                                                                                           pady=25)
@@ -1032,7 +1067,7 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
     option_target = ttk.Combobox(base, width=27, textvariable=n4)
     option_target['values'] = ('Yes', 'No')
     option_target.grid(column=1, row=7)
-    option_target.current(1)
+    option_target.current(0)
 
     # fifth dropdown menu
     ttk.Label(base, text='How to impute missing values?', font=('Times New Roman', 10)).grid(column=0, row=8, padx=10,
@@ -1041,7 +1076,7 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
     option_impute = ttk.Combobox(base, width=27, textvariable=n5)
     option_impute['values'] = ('MICE', 'KNN', 'Zeros', 'Leave them in')
     option_impute.grid(column=1, row=8)
-    option_impute.current(2)
+    option_impute.current(1)
 
     # sixth dropdown menu
     ttk.Label(base, text='What feature selection/extraction method?', font=('Times New Roman', 10)).grid(column=0,
@@ -1053,7 +1088,7 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
     option_ml['values'] = ('PCA', 'Recursive VIF', 'Information Gain', 'SURF', 'ReliefF', 'MultiSURF', 'F Score',
                            'Hybrid', 'Backward', 'Forward', 'RFE', 'None')
     option_ml.grid(row=9, column=1)
-    option_ml.current(3)
+    option_ml.current(2)
 
     # seventh widget as an entry box for selecting hybrid feature selection methods
     ttk.Label(base, text="If hybrid, input selection w/ format 'Filter, Wrapper':",
@@ -1062,10 +1097,18 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
     entry_hybrid = tk.Entry(base, textvariable=n7, font=('Times New Roman', 10))
     entry_hybrid.grid(column=1, row=10)
 
+    ttk.Label(base, text="Treat ordinal encoded variables as continuous or discrete?",
+              font=('Times New Roman', 10)).grid(column=0, row=11, padx=10, pady=25)
+    n8 = tk.StringVar()
+    option_ord = ttk.Combobox(base, width=27, textvariable=n8)
+    option_ord['values'] = ('Continuous', 'Discrete')
+    option_ord.grid(column=1, row=11)
+    option_ord.current(0)
+
     # submit button to close the window and proceed with the function
 
     exit_button = tk.Button(base, text='Start', command=base.destroy)
-    exit_button.grid(column=1, row=11)
+    exit_button.grid(column=1, row=12)
 
     base.mainloop()
 
@@ -1101,6 +1144,10 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
     else:
         hybrid_plan = None
 
+    if n8.get() == "Discrete":
+        ords = ordinal_cats
+    else:
+        ords = None
 
     # check if weights have been assigned to the declared ordinal categorical variables
 
@@ -1123,8 +1170,7 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
 
     pipe, filter_wrapper = setup_pipeline(df, targets, ML=ml_check, decision=ml_method, hi_cat_cols=tb_catboost,
                                           lo_cat_cols=tb_onehot, cat_target=cat_target, imp_choice=imputer,
-                                          hybrid_plan=hybrid_plan)
-
+                                          hybrid_plan=hybrid_plan, ordinal_as_discrete=ords)
 
     # additional feature: output a dictionary for tuned elements in the initial pipeline, so that they don't
     # have to be used in the predictive algo
@@ -1141,12 +1187,14 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
         tune_grid['imp__max_iter'] = max_iter
         tune_grid['imp__initial_strategy'] = initial_strategy
         tune_grid['imp__estimator'] = estimator
+        tune_grid['norm__norm'] = ['l1', 'l2', 'max', 'min-max']
     elif imputer == 'KNN':
         ks = [3, 10, int(np.sqrt(len(df)) // 2), int(np.sqrt(len(df)))]
         weights = ['uniform', 'distance']
         tune_grid = dict()
         tune_grid['imp__n_neighbors'] = ks
         tune_grid['imp__weights'] = weights
+        tune_grid['norm__norm'] = ['l1', 'l2', 'max', 'min-max']
     else:
         tune_grid = dict()
 
@@ -1164,6 +1212,12 @@ def data_sanitation(data, target, percent_thresh=0.65, kill_row_if_nan_in=None, 
     # but before this, unravel target to avoid column vector error message that comes from passing pd.Series
     # values method gives 1d numpy array, ravel converts from column to row vector
 
-    targets = targets.values.ravel()
+    # This is not needed if the target is categorical, as it has already been transformed into an ndarray by
+    # the ordinal sklearn transformer
+
+    if cat_target is False:
+        targets = targets.values.ravel()
+    else:
+        targets = targets.flatten()
 
     return df, targets, pipe, tune_grid
