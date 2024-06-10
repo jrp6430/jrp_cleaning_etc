@@ -86,7 +86,7 @@ def geo_search_csv_links(query_string, organism_string):
     driver = webdriver.Chrome(service=service, options=options)
     driver.get("https://www.ncbi.nlm.nih.gov/geo/browse/")
     # first, find the search bar and enter the query string given in the function call
-    search_bar = driver.find_element(by=By.ID, value='session_key')
+    search_bar = driver.find_element(by=By.CLASS_NAME, value='searchTxt')
     search_bar.send_keys(query_string)
     # Now, that the search bar has been filled, click the submit button
     driver.find_element(by=By.CLASS_NAME, value='button').click()
